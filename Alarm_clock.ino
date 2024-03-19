@@ -1,194 +1,159 @@
-/**
-   Arduino Digital Alarm Clock
+// Date and time functions using a DS1307 RTC connected via I2C and Wire lib
+#include "RTClib.h"
+#include <Wire.h>
+#include <SD.h>
 
-   Copyright (C) 2020, Uri Shaked.
-   Released under the MIT License.
+// Pin assignments
+int chipSelect = 2; // Chip select pin for SD card
+File file;
 
-*/
+// Buzzer pin
+int buzzer = 7;
 
-#include <SevSeg.h>
-#include "Button.h"
-#include "AlarmTone.h"
-#include "Clock.h"
-#include "config.h"
+// Variables for:
+String time = ""; // time
+int row = 0; // file row index
+bool waitNewDay = false; // if waiting for the next day
+bool waitAlarm = false; // if it is waiting for the alarm
+int hours; // hours for next alarm
+int minutes; // minutes for next alarm
 
-const int COLON_PIN = 13;
-const int SPEAKER_PIN = A3;
+DateTime day;
 
-Button hourButton(A0);
-Button minuteButton(A1);
-Button alarmButton(A2);
+RTC_DS1307 rtc;
 
-AlarmTone alarmTone;
-Clock clock;
-SevSeg sevseg;
-
-enum DisplayState {
-  DisplayClock,
-  DisplayAlarmStatus,
-  DisplayAlarmTime,
-  DisplayAlarmActive,
-  DisplaySnooze,
-};
-
-DisplayState displayState = DisplayClock;
-long lastStateChange = 0;
-
-void changeDisplayState(DisplayState newValue) {
-  displayState = newValue;
-  lastStateChange = millis();
-}
-
-long millisSinceStateChange() {
-  return millis() - lastStateChange;
-}
-
-void setColon(bool value) {
-  digitalWrite(COLON_PIN, value ? LOW : HIGH);
-}
-
-void displayTime() {
-  DateTime now = clock.now();
-  bool blinkState = now.second() % 2 == 0;
-  sevseg.setNumber(now.hour() * 100 + now.minute());
-  setColon(blinkState);
-}
-
-void clockState() {
-  displayTime();
-
-  if (alarmButton.read() == Button::RELEASED && clock.alarmActive()) {
-    // Read alarmButton has_changed() to clear its state
-    alarmButton.has_changed();
-    changeDisplayState(DisplayAlarmActive);
-    return;
+void setup () {
+  
+  Serial.begin(9600); // Start serial communication
+  
+  // Initialize the RTC module
+  if (! rtc.begin()) {
+    Serial.println("RTC module not found!");
   }
 
-  if (hourButton.pressed()) {
-    clock.incrementHour();
-  }
-  if (minuteButton.pressed()) {
-    clock.incrementMinute();
-  }
-  if (alarmButton.pressed()) {
-    clock.toggleAlarm();
-    changeDisplayState(DisplayAlarmStatus);
+  pinMode(buzzer, OUTPUT); // Set buzzer pin as output
+  pinMode(chipSelect, OUTPUT); // Set SD card chip select pin as output
+  
+  // Attempt to initialize the SD card
+  if (!SD.begin(chipSelect)){
+    Serial.println("SD card not found!");
+    delay(100);
+    setup(); // Retry setup if SD card initialization fails
   }
 }
 
-void alarmStatusState() {
-  setColon(false);
-  sevseg.setChars(clock.alarmEnabled() ? " on" : " off");
-  if (millisSinceStateChange() > ALARM_STATUS_DISPLAY_TIME) {
-    changeDisplayState(clock.alarmEnabled() ? DisplayAlarmTime : DisplayClock);
-    return;
-  }
-}
-
-void alarmTimeState() {
-  DateTime alarm = clock.alarmTime();
-  sevseg.setNumber(alarm.hour() * 100 + alarm.minute(), -1);
-
-  if (millisSinceStateChange() > ALARM_HOUR_DISPLAY_TIME || alarmButton.pressed()) {
-    changeDisplayState(DisplayClock);
-    return;
-  }
-
-  if (hourButton.pressed()) {
-    clock.incrementAlarmHour();
-    lastStateChange = millis();
-  }
-  if (minuteButton.pressed()) {
-    clock.incrementAlarmMinute();
-    lastStateChange = millis();
-  }
-  if (alarmButton.pressed()) {
-    changeDisplayState(DisplayClock);
-  }
-}
-
-void alarmState() {
-  displayTime();
-
-  if (alarmButton.read() == Button::RELEASED) {
-    alarmTone.play();
-  }
-  if (alarmButton.pressed()) {
-    alarmTone.stop();
-  }
-  if (alarmButton.released()) {
-    alarmTone.stop();
-    bool longPress = alarmButton.repeat_count() > 0;
-    if (longPress) {
-      clock.stopAlarm();
-      changeDisplayState(DisplayClock);
-    } else {
-      clock.snooze();
-      changeDisplayState(DisplaySnooze);
+void loop () {
+  
+    // If RTC is not running, set it to the compile time
+    if (!rtc.isrunning()) {
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
     }
-  }
+
+    DateTime now = rtc.now(); // Get current time from RTC
+
+    // If not waiting for a new day
+    if (!waitNewDay){
+      
+      // Gets the day
+      day = now.day();
+      
+      // Check if it's a weekend (Saturday or Sunday)
+      if (now.dayOfTheWeek() == 6 || now.dayOfTheWeek() == 7){
+        
+        Serial.println("No alarm today!");
+        
+        if (now.dayOfTheWeek() == 6) {
+          
+          // Delay one day to save resources (if it's Saturday)
+          delay(86400000);
+        }
+      }
+    
+      if (!waitAlarm){
+        getTime(now); // Get alarm time from file
+      
+        hours = time.substring(0, 2).toInt(); // Extract hours from time string
+        minutes = time.substring(3).toInt(); // Extract minutes from time string
+      }
+    
+      DateTime future (now.year(), now.month(), now.day(), hours, minutes, 0); // Create DateTime object for next alarm 
+      
+      // Check if current time is greater than next alarm
+      if (now > future) {
+
+        // If it is greater, get to the next row of the file
+        row++;
+        waitAlarm = false;
+        Serial.println("Next alarm!");
+        return;
+      }
+    
+      TimeSpan result = future - now; // Calculate time difference between current time and future alarm time
+    
+      // Trigger alarm based on time difference
+      if (result.seconds() == 0 && result.hours() == 0 && result.minutes() == 0){
+        // Alarm goes off at exact time
+        Serial.println("The alarm goes off!");
+        digitalWrite(buzzer, HIGH);
+
+        // The alarm sounds for 3 seconds
+        delay(3000);
+        
+        digitalWrite(buzzer, LOW);
+
+        // Gets the next alarm
+        row++;
+        waitAlarm = false;
+        
+        Serial.println("New row!");
+      } 
+      // Some checkpoints
+      else if (result.seconds() == 0 && result.minutes() == 0 && result.hours() == 1){
+        
+        // Alarm goes off after 1 hour
+        Serial.println("The alarm goes off after 1 hour!");
+      } else if (result.seconds() == 0 && result.minutes() == 30 && result.hours() == 0){
+        
+        // Alarm goes off after 30 minutes
+        Serial.println("The alarm goes off after 30 minutes!");
+      } else if (result.seconds() == 0 && result.minutes() == 15 && result.hours() == 0){
+        
+        // Alarm goes off after 15 minutes
+        Serial.println("The alarm goes off after 15 minutes!");
+      }
+    } else if (day != now.day()){
+      waitNewDay = false;
+    }
 }
 
-void snoozeState() {
-  sevseg.setChars("****");
-  if (millisSinceStateChange() > SNOOZE_DISPLAY_TIME) {
-    changeDisplayState(DisplayClock);
-    return;
-  }
-}
+// Function to get alarm times from the file
+void getTime(DateTime now){
+  file = SD.open("file.txt", FILE_READ); // Open file on SD card for reading
+  
+  if (file){
+    
+    // Skip the already read lines in the file
+    for (int i = 0; i < row; i++) {
+      while (file.read() != '\n') {}
+    }
 
-void setup() {
-  Serial.begin(115200);
-
-  clock.begin();
-
-  hourButton.begin();
-  hourButton.set_repeat(500, 200);
-
-  minuteButton.begin();
-  minuteButton.set_repeat(500, 200);
-
-  alarmButton.begin();
-  alarmButton.set_repeat(1000, -1);
-
-  alarmTone.begin(SPEAKER_PIN);
-
-  pinMode(COLON_PIN, OUTPUT);
-
-  byte digits = 4;
-  byte digitPins[] = {2, 3, 4, 5};
-  byte segmentPins[] = {6, 7, 8, 9, 10, 11, 12};
-  bool resistorsOnSegments = false;
-  bool updateWithDelays = false;
-  bool leadingZeros = true;
-  bool disableDecPoint = true;
-  sevseg.begin(DISPLAY_TYPE, digits, digitPins, segmentPins, resistorsOnSegments,
-               updateWithDelays, leadingZeros, disableDecPoint);
-  sevseg.setBrightness(90);
-}
-
-void loop() {
-  sevseg.refreshDisplay();
-
-  switch (displayState) {
-    case DisplayClock:
-      clockState();
-      break;
-
-    case DisplayAlarmStatus:
-      alarmStatusState();
-      break;
-
-    case DisplayAlarmTime:
-      alarmTimeState();
-      break;
-
-    case DisplayAlarmActive:
-      alarmState();
-      break;
-
-    case DisplaySnooze:
-      snoozeState();
-      break;
+    // Read and print the third line (alarm time)
+    time = file.readStringUntil('\n');
+    
+    if (time == ""){
+      
+      // Reset row index and flag to wait for a new day
+      row = 0;
+      waitNewDay = true;
+      
+      Serial.println("Waiting new day");
+    }
+    
+    file.close(); // Close the file
+    waitAlarm = true; // Set flag to wait for the alarm
+  } else {
+    
+    Serial.println("Could not open the file (reading).");
+    setup(); // Retry setup if file opening fails
   }
 }
